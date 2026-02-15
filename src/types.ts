@@ -1,6 +1,17 @@
 export interface Env {
   BOT_CONFIG: KVNamespace;
-  TELEGRAM_BOT_TOKEN: string;
+  /**
+   * Bluesky handle for the account that receives DMs and sends auto-replies.
+   */
+  BSKY_HANDLE: string;
+  /**
+   * Bluesky app password. Must have "Allow access to your direct messages" enabled.
+   */
+  BSKY_APP_PASSWORD: string;
+  /**
+   * Bluesky PDS URL. Default: https://bsky.social
+   */
+  BSKY_SERVICE_URL?: string;
   /**
    * Secret for signing admin session cookies. Required for /admin.
    */

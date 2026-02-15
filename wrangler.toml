@@ -1,18 +1,24 @@
-name = "telegram-welcome-bot"
+name = "babesky-dm-reply-bot"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-# KV Namespace for bot config and welcomed users
-# First run: npx wrangler kv namespace create BOT_CONFIG
-# Then paste the returned id below.
+# Cron: poll for new DMs every minute
+[triggers]
+crons = ["* * * * *"]
+
+# KV Namespace for bot config and replied-users
+# Create in Cloudflare Dashboard: Workers & Pages → KV → Create a namespace
+# Then add as binding BOT_CONFIG in Worker Settings
 [[kv_namespaces]]
 binding = "BOT_CONFIG"
 id = "00000000000000000000000000000000"
 
-# Environment variables
+# Environment variables (set in Dashboard)
 [vars]
+BSKY_SERVICE_URL = "https://bsky.social"
 WEBHOOK_BASE_URL = ""
 
-# Secrets (set via: wrangler secret put SECRET_NAME)
-# TELEGRAM_BOT_TOKEN - from @BotFather
-# ADMIN_SESSION_SECRET - random 32+ char string for session signing
+# Secrets (set in Dashboard → Worker → Settings → Variables and Secrets)
+# BSKY_HANDLE - your Bluesky handle (e.g. you.bsky.social)
+# BSKY_APP_PASSWORD - app password with "Allow access to your direct messages" enabled
+# ADMIN_SESSION_SECRET - random 32+ char string for admin session signing

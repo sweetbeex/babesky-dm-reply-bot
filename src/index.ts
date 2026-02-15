@@ -1,7 +1,8 @@
 import { Env, BotConfig } from './types';
+import { BlueskyDmClient } from './bluesky-dm';
 
 const CONFIG_KEY = 'config';
-const WELCOMED_PREFIX = 'welcomed:';
+const REPLIED_PREFIX = 'replied:';
 const DEFAULT_WELCOME = "Hi! Thanks for reaching out. How can I help you today?";
 const MAX_DELAY_SECONDS = 300;
 
@@ -110,25 +111,66 @@ function clearSessionCookie(_baseUrl: string): string {
   return `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
 
-const TELEGRAM_API = 'https://api.telegram.org/bot';
-
-async function sendTelegramMessage(
-  token: string,
-  chatId: string | number,
-  text: string
-): Promise<boolean> {
-  const url = `${TELEGRAM_API}${token}/sendMessage`;
-  const res = await fetch(url, {
-    method: 'POST',
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: 'HTML',
-    }),
   });
-  const data = (await res.json()) as { ok?: boolean };
-  return data.ok === true;
+}
+
+/**
+ * Cron handler: poll Bluesky DMs and reply to first-time messagers.
+ */
+async function runDmReplyCycle(env: Env): Promise<void> {
+  const config = await getConfig(env.BOT_CONFIG);
+  if (!config.enabled) return;
+
+  const handle = env.BSKY_HANDLE;
+  const appPassword = env.BSKY_APP_PASSWORD;
+  const serviceUrl = env.BSKY_SERVICE_URL || 'https://bsky.social';
+
+  if (!handle || !appPassword) {
+    console.error('BSKY_HANDLE or BSKY_APP_PASSWORD not set');
+    return;
+  }
+
+  const client = new BlueskyDmClient(handle, appPassword, serviceUrl);
+  await client.login(appPassword);
+
+  const welcomeMsg = config.welcomeMessage?.trim() || DEFAULT_WELCOME;
+  const delay = Math.min(MAX_DELAY_SECONDS, Math.max(0, config.messageDelaySeconds ?? 0));
+
+  let cursor: string | undefined;
+  let repliedCount = 0;
+
+  do {
+    const { convos, cursor: nextCursor } = await client.listConvos(50, cursor);
+    cursor = nextCursor;
+
+    for (const convo of convos) {
+      const otherDid = client.getOtherParticipantDid(convo);
+      if (!otherDid) continue;
+      if (!client.isLastMessageFromOther(convo)) continue; // Last message is from us, skip
+
+      const repliedKey = `${REPLIED_PREFIX}${otherDid}`;
+      const alreadyReplied = await env.BOT_CONFIG.get(repliedKey);
+      if (alreadyReplied) continue;
+
+      if (delay > 0) {
+        await new Promise((r) => setTimeout(r, delay * 1000));
+      }
+
+      const sent = await client.sendMessage(convo.id, welcomeMsg);
+      if (sent) {
+        await env.BOT_CONFIG.put(repliedKey, '1', { expirationTtl: 60 * 60 * 24 * 365 });
+        repliedCount++;
+      }
+    }
+  } while (cursor);
+
+  if (repliedCount > 0) {
+    console.log(`Replied to ${repliedCount} new DM(s)`);
+  }
 }
 
 export default {
@@ -136,14 +178,8 @@ export default {
     const url = new URL(request.url);
     const baseUrl = env.WEBHOOK_BASE_URL || `https://${new URL(request.url).host}`;
 
-    // Health check
     if (url.pathname === '/health' || url.pathname === '/') {
       return jsonResponse({ status: 'ok' });
-    }
-
-    // Telegram webhook
-    if (url.pathname === '/webhook/telegram' && request.method === 'POST') {
-      return handleTelegramWebhook(request, env);
     }
 
     // Admin
@@ -153,59 +189,11 @@ export default {
 
     return new Response('Not Found', { status: 404 });
   },
+
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await runDmReplyCycle(env);
+  },
 };
-
-async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
-  try {
-    const update = (await request.json()) as {
-      message?: {
-        chat?: { id: number; type?: string };
-        from?: { id: number; username?: string; first_name?: string };
-        text?: string;
-      };
-    };
-
-    const message = update.message;
-    if (!message?.from?.id) {
-      return jsonResponse({ ok: true });
-    }
-
-    const userId = message.from.id;
-    const chatId = message.chat?.id ?? userId;
-
-    // Only respond to private chats (DMs)
-    if (message.chat?.type && message.chat.type !== 'private') {
-      return jsonResponse({ ok: true });
-    }
-
-    const config = await getConfig(env.BOT_CONFIG);
-
-    // If flow is disabled, do nothing
-    if (!config.enabled) {
-      return jsonResponse({ ok: true });
-    }
-
-    const welcomedKey = `${WELCOMED_PREFIX}${userId}`;
-    const alreadyWelcomed = await env.BOT_CONFIG.get(welcomedKey);
-
-    if (!alreadyWelcomed) {
-      const delay = Math.min(300, Math.max(0, config.messageDelaySeconds ?? 0));
-      if (delay > 0) {
-        await new Promise((r) => setTimeout(r, delay * 1000));
-      }
-      const welcomeMsg = config.welcomeMessage?.trim() || DEFAULT_WELCOME;
-      const sent = await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, welcomeMsg);
-      if (sent) {
-        await env.BOT_CONFIG.put(welcomedKey, '1', { expirationTtl: 60 * 60 * 24 * 365 }); // 1 year
-      }
-    }
-
-    return jsonResponse({ ok: true });
-  } catch (error) {
-    console.error('Telegram webhook error:', error);
-    return jsonResponse({ ok: false, error: String(error) }, 500);
-  }
-}
 
 async function handleAdmin(
   request: Request,
@@ -217,14 +205,12 @@ async function handleAdmin(
   const kv = env.BOT_CONFIG;
   const config = await getConfig(kv);
 
-  // Setup wizard (when not yet configured)
   if (!config.setupComplete && path !== '/setup' && !path.startsWith('/api/')) {
     return new Response(getSetupWizardHtml(baseUrl), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
   }
 
-  // POST /admin/api/setup - complete initial setup
   if (path === '/api/setup' && request.method === 'POST') {
     const body = (await request.json()) as {
       adminPassword?: string;
@@ -251,7 +237,6 @@ async function handleAdmin(
     return jsonResponse({ success: true });
   }
 
-  // If setup not complete, only allow setup API
   if (!config.setupComplete) {
     return new Response(getSetupWizardHtml(baseUrl), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
@@ -261,7 +246,7 @@ async function handleAdmin(
   const secret = env.ADMIN_SESSION_SECRET;
   if (!secret) {
     return jsonResponse(
-      { error: 'Admin not configured: ADMIN_SESSION_SECRET missing. Set via wrangler secret put ADMIN_SESSION_SECRET.' },
+      { error: 'Admin not configured: ADMIN_SESSION_SECRET missing.' },
       503
     );
   }
@@ -269,7 +254,6 @@ async function handleAdmin(
   const sessionToken = getSessionFromRequest(request);
   const isAuthenticated = sessionToken ? await verifySession(sessionToken, secret) : false;
 
-  // POST /admin/login - authenticate with password
   if (path === '/login' && request.method === 'POST') {
     const body = (await request.json()) as { password?: string };
     const password = body.password || '';
@@ -291,7 +275,6 @@ async function handleAdmin(
     });
   }
 
-  // GET /admin/logout
   if (path === '/logout' && request.method === 'GET') {
     return new Response(null, {
       status: 302,
@@ -302,7 +285,6 @@ async function handleAdmin(
     });
   }
 
-  // GET/POST /admin/api/config - require auth
   if (path === '/api/config') {
     if (!isAuthenticated) {
       return jsonResponse({ error: 'Unauthorized' }, 401);
@@ -332,7 +314,6 @@ async function handleAdmin(
     return new Response(null, { status: 405 });
   }
 
-  // POST /admin/api/toggle - quick toggle (require auth)
   if (path === '/api/toggle' && request.method === 'POST') {
     if (!isAuthenticated) return jsonResponse({ error: 'Unauthorized' }, 401);
     const body = (await request.json()) as { enabled?: boolean };
@@ -341,7 +322,6 @@ async function handleAdmin(
     return jsonResponse({ success: true, enabled: newConfig.enabled });
   }
 
-  // GET /admin - serve page
   if ((path === '/' || path === '') && request.method === 'GET') {
     if (!isAuthenticated) {
       return new Response(getAdminLoginHtml(baseUrl), {
@@ -356,13 +336,6 @@ async function handleAdmin(
   return new Response('Not Found', { status: 404 });
 }
 
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
 function getSetupWizardHtml(baseUrl: string): string {
   const adminUrl = `${baseUrl}/admin`;
   const defaultMsg = DEFAULT_WELCOME.replace(/"/g, '&quot;');
@@ -371,7 +344,7 @@ function getSetupWizardHtml(baseUrl: string): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Setup - Welcome Bot</title>
+  <title>Setup - Bluesky DM Reply Bot</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 500px; margin: 2rem auto; padding: 1rem; }
@@ -385,11 +358,10 @@ function getSetupWizardHtml(baseUrl: string): string {
     button { padding: 0.5rem 1rem; background: #0085ff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem; }
     button:hover { background: #0070dd; }
     .error { color: #c00; margin-bottom: 1rem; font-size: 0.9rem; }
-    .success { color: #080; }
   </style>
 </head>
 <body>
-  <h1>Welcome Bot Setup</h1>
+  <h1>Bluesky DM Reply Bot — Setup</h1>
   <p class="sub">Configure your bot. You can change these later from the admin panel.</p>
   <div class="card">
     <h2>1. Admin password</h2>
@@ -398,11 +370,11 @@ function getSetupWizardHtml(baseUrl: string): string {
     <input type="password" id="password" placeholder="Choose a strong password" minlength="8" required>
   </div>
   <div class="card">
-    <h2>2. Welcome message</h2>
-    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Sent to users the first time they DM your bot. Supports HTML.</p>
+    <h2>2. Auto-reply message</h2>
+    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Sent when someone DMs your Bluesky account for the first time. Plain text only (max 1000 chars).</p>
     <label for="welcome">Message</label>
-    <textarea id="welcome" maxlength="4000" placeholder="${defaultMsg}">${defaultMsg}</textarea>
-    <span class="char-count" id="charCount">${defaultMsg.length} / 4000 characters</span>
+    <textarea id="welcome" maxlength="1000" placeholder="${defaultMsg}">${defaultMsg}</textarea>
+    <span class="char-count" id="charCount">${defaultMsg.length} / 1000 characters</span>
   </div>
   <div class="card">
     <h2>3. Message delay</h2>
@@ -413,14 +385,14 @@ function getSetupWizardHtml(baseUrl: string): string {
   <div class="card">
     <h2>4. Enable</h2>
     <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Start the auto-reply flow immediately?</p>
-    <label><input type="checkbox" id="enabled" checked> Enable welcome messages</label>
+    <label><input type="checkbox" id="enabled" checked> Enable auto-replies</label>
   </div>
   <div id="error" class="error" style="display:none"></div>
   <button id="saveBtn">Complete Setup</button>
   <script>
     const adminUrl = '${adminUrl}';
     document.getElementById('welcome').addEventListener('input', function() {
-      document.getElementById('charCount').textContent = this.value.length + ' / 4000 characters';
+      document.getElementById('charCount').textContent = this.value.length + ' / 1000 characters';
     });
     document.getElementById('saveBtn').addEventListener('click', async () => {
       const password = document.getElementById('password').value;
@@ -520,7 +492,7 @@ function getAdminPageHtml(baseUrl: string): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Welcome Bot Admin</title>
+  <title>Bluesky DM Reply Bot — Admin</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 680px; margin: 2rem auto; padding: 1rem; }
@@ -533,8 +505,6 @@ function getAdminPageHtml(baseUrl: string): string {
     textarea { width: 100%; min-height: 80px; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; font-family: inherit; resize: vertical; }
     button { padding: 0.5rem 1rem; background: #0085ff; color: white; border: none; border-radius: 4px; cursor: pointer; }
     button:hover { background: #0070dd; }
-    button.secondary { background: #666; }
-    button.secondary:hover { background: #555; }
     .actions { display: flex; gap: 0.5rem; margin-top: 1rem; align-items: center; flex-wrap: wrap; }
     .status { font-size: 0.85rem; margin-top: 0.5rem; }
     .success { color: #080; }
@@ -549,28 +519,28 @@ function getAdminPageHtml(baseUrl: string): string {
   </style>
 </head>
 <body>
-  <h1>Welcome Bot</h1>
-  <p class="sub">Configure the preset message sent when users DM your bot for the first time.</p>
+  <h1>Bluesky DM Reply Bot</h1>
+  <p class="sub">Configure the preset message sent when users DM your Bluesky account for the first time.</p>
   <div class="card">
     <h2>Flow status</h2>
     <div class="toggle-wrap">
       <div id="toggle" class="toggle" role="button" tabindex="0" aria-pressed="false"></div>
       <span id="toggleLabel" class="toggle-label">Off</span>
     </div>
-    <p class="sub" style="margin: 0.5rem 0 0 0; font-size: 0.85rem;">When on, new users who DM the bot receive the welcome message below.</p>
+    <p class="sub" style="margin: 0.5rem 0 0 0; font-size: 0.85rem;">When on, new users who DM you receive the auto-reply below. Runs on a schedule (every minute).</p>
   </div>
   <div class="card">
     <h2>Message delay</h2>
-    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Seconds to wait before sending the welcome message (0 = instant). Max 300.</p>
+    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Seconds to wait before sending (0 = instant). Max 300.</p>
     <label for="delay">Delay (seconds)</label>
     <input type="number" id="delay" min="0" max="300" value="0" step="1" style="width: 6em;">
   </div>
   <div class="card">
-    <h2>Welcome message</h2>
-    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Sent to each user only on their first message. Supports HTML (e.g. &lt;b&gt;bold&lt;/b&gt;).</p>
+    <h2>Auto-reply message</h2>
+    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Sent once per user on their first DM. Plain text, max 1000 characters.</p>
     <label for="welcome">Message</label>
-    <textarea id="welcome" maxlength="4000"></textarea>
-    <span id="charCount" class="char-count">0 / 4000 characters</span>
+    <textarea id="welcome" maxlength="1000"></textarea>
+    <span id="charCount" class="char-count">0 / 1000 characters</span>
   </div>
   <div class="actions">
     <button id="saveBtn">Save changes</button>
@@ -586,7 +556,7 @@ function getAdminPageHtml(baseUrl: string): string {
       if (res.status === 401) { window.location.reload(); return; }
       const data = await res.json();
       document.getElementById('welcome').value = data.welcomeMessage || defaultMsg;
-      document.getElementById('charCount').textContent = (data.welcomeMessage || '').length + ' / 4000 characters';
+      document.getElementById('charCount').textContent = (data.welcomeMessage || '').length + ' / 1000 characters';
       const delayInput = document.getElementById('delay');
       if (delayInput) delayInput.value = String(data.messageDelaySeconds ?? 0);
       const enabled = !!data.enabled;
@@ -598,7 +568,7 @@ function getAdminPageHtml(baseUrl: string): string {
     }
 
     document.getElementById('welcome').addEventListener('input', function() {
-      document.getElementById('charCount').textContent = this.value.length + ' / 4000 characters';
+      document.getElementById('charCount').textContent = this.value.length + ' / 1000 characters';
     });
 
     document.getElementById('toggle').addEventListener('click', async function() {

@@ -1,13 +1,13 @@
 {
-  "name": "telegram-welcome-bot",
+  "name": "babesky-dm-reply-bot",
   "version": "1.0.0",
-  "description": "Telegram bot that sends a preset welcome message to users who DM first",
+  "description": "Bluesky DM auto-reply: sends a preset message when users DM your account for the first time",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
-  "devDependencies": {
+  "dependencies":{"@atproto/api":"^0.8.0"},"devDependencies": {
     "@cloudflare/workers-types": "^4.20241106.0",
     "typescript": "^5.3.3",
     "wrangler": "^3.78.0"
