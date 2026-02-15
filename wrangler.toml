@@ -1,0 +1,18 @@
+name = "telegram-welcome-bot"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# KV Namespace for bot config and welcomed users
+# First run: npx wrangler kv namespace create BOT_CONFIG
+# Then paste the returned id below.
+[[kv_namespaces]]
+binding = "BOT_CONFIG"
+id = "00000000000000000000000000000000"
+
+# Environment variables
+[vars]
+WEBHOOK_BASE_URL = ""
+
+# Secrets (set via: wrangler secret put SECRET_NAME)
+# TELEGRAM_BOT_TOKEN - from @BotFather
+# ADMIN_SESSION_SECRET - random 32+ char string for session signing
