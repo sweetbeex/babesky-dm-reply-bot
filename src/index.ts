@@ -1,10 +1,14 @@
 import { Env, BotConfig } from './types';
-import { BlueskyDmClient } from './bluesky-dm';
+import { BlueskyDmClient, RateLimitError } from './bluesky-dm';
 
 const CONFIG_KEY = 'config';
+const SESSION_KEY = 'bsky_session';
+const BSKY_SESSION_TTL_SEC = 3600; // 1 hour — reduces login calls (Bluesky limit: 300/day)
 const REPLIED_PREFIX = 'replied:';
 const DEFAULT_WELCOME = "Hi! Thanks for reaching out. How can I help you today?";
 const MAX_DELAY_SECONDS = 300;
+const MAX_REPLIES_PER_RUN = 10; // Cap to avoid spam flags
+const DELAY_BETWEEN_SENDS_MS = 3000; // 3 seconds between DMs when replying to multiple users
 
 function clampDelay(val: number): number {
   return Math.min(MAX_DELAY_SECONDS, Math.max(0, Math.round(Number(val)) || 0));
@@ -44,7 +48,7 @@ async function verifyPassword(password: string, hash: string): Promise<boolean> 
 }
 
 const SESSION_COOKIE_NAME = 'admin_session';
-const SESSION_TTL_SEC = 7 * 24 * 60 * 60;
+const ADMIN_SESSION_TTL_SEC = 7 * 24 * 60 * 60;
 
 function getSessionFromRequest(request: Request): string | null {
   const cookieHeader = request.headers.get('Cookie');
@@ -58,7 +62,7 @@ function getSessionFromRequest(request: Request): string | null {
 }
 
 async function createSession(secret: string): Promise<string> {
-  const payload = { exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SEC };
+  const payload = { exp: Math.floor(Date.now() / 1000) + ADMIN_SESSION_TTL_SEC };
   const data = JSON.stringify(payload);
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -104,7 +108,7 @@ async function verifySession(token: string, secret: string): Promise<boolean> {
 function sessionCookie(token: string, baseUrl: string): string {
   const url = new URL(baseUrl);
   const secure = url.protocol === 'https:' ? 'Secure; ' : '';
-  return `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; ${secure}SameSite=Lax; Max-Age=${SESSION_TTL_SEC}`;
+  return `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; ${secure}SameSite=Lax; Max-Age=${ADMIN_SESSION_TTL_SEC}`;
 }
 
 function clearSessionCookie(_baseUrl: string): string {
@@ -120,6 +124,7 @@ function jsonResponse(data: unknown, status = 200): Response {
 
 /**
  * Cron handler: poll Bluesky DMs and reply to first-time messagers.
+ * Includes rate-limit safeguards: session caching, max replies per run, delay between sends.
  */
 async function runDmReplyCycle(env: Env): Promise<void> {
   const config = await getConfig(env.BOT_CONFIG);
@@ -135,41 +140,75 @@ async function runDmReplyCycle(env: Env): Promise<void> {
   }
 
   const client = new BlueskyDmClient(handle, appPassword, serviceUrl);
-  await client.login(appPassword);
 
-  const welcomeMsg = config.welcomeMessage?.trim() || DEFAULT_WELCOME;
-  const delay = Math.min(MAX_DELAY_SECONDS, Math.max(0, config.messageDelaySeconds ?? 0));
-
-  let cursor: string | undefined;
-  let repliedCount = 0;
-
-  do {
-    const { convos, cursor: nextCursor } = await client.listConvos(50, cursor);
-    cursor = nextCursor;
-
-    for (const convo of convos) {
-      const otherDid = client.getOtherParticipantDid(convo);
-      if (!otherDid) continue;
-      if (!client.isLastMessageFromOther(convo)) continue; // Last message is from us, skip
-
-      const repliedKey = `${REPLIED_PREFIX}${otherDid}`;
-      const alreadyReplied = await env.BOT_CONFIG.get(repliedKey);
-      if (alreadyReplied) continue;
-
-      if (delay > 0) {
-        await new Promise((r) => setTimeout(r, delay * 1000));
-      }
-
-      const sent = await client.sendMessage(convo.id, welcomeMsg);
-      if (sent) {
-        await env.BOT_CONFIG.put(repliedKey, '1', { expirationTtl: 60 * 60 * 24 * 365 });
-        repliedCount++;
+  try {
+    const cached = await env.BOT_CONFIG.get(SESSION_KEY);
+    if (cached) {
+      try {
+        const { accessJwt, did } = JSON.parse(cached) as { accessJwt: string; did: string };
+        if (accessJwt && did) {
+          client.setCachedSession(accessJwt, did);
+        }
+      } catch {
+        /* ignore invalid cache */
       }
     }
-  } while (cursor);
 
-  if (repliedCount > 0) {
-    console.log(`Replied to ${repliedCount} new DM(s)`);
+    if (!client.getSessionForCache()) {
+      await client.login(appPassword);
+      const sess = client.getSessionForCache();
+      if (sess) {
+        await env.BOT_CONFIG.put(SESSION_KEY, JSON.stringify(sess), { expirationTtl: BSKY_SESSION_TTL_SEC });
+      }
+    }
+
+    const welcomeMsg = config.welcomeMessage?.trim() || DEFAULT_WELCOME;
+    const delay = Math.min(MAX_DELAY_SECONDS, Math.max(0, config.messageDelaySeconds ?? 0));
+
+    let cursor: string | undefined;
+    let repliedCount = 0;
+
+    do {
+      const { convos, cursor: nextCursor } = await client.listConvos(50, cursor);
+      cursor = nextCursor;
+
+      for (const convo of convos) {
+        if (repliedCount >= MAX_REPLIES_PER_RUN) break;
+
+        const otherDid = client.getOtherParticipantDid(convo);
+        if (!otherDid) continue;
+        if (!client.isLastMessageFromOther(convo)) continue;
+
+        const repliedKey = `${REPLIED_PREFIX}${otherDid}`;
+        const alreadyReplied = await env.BOT_CONFIG.get(repliedKey);
+        if (alreadyReplied) continue;
+
+        if (delay > 0) {
+          await new Promise((r) => setTimeout(r, delay * 1000));
+        }
+
+        const sent = await client.sendMessage(convo.id, welcomeMsg);
+        if (sent) {
+          await env.BOT_CONFIG.put(repliedKey, '1', { expirationTtl: 60 * 60 * 24 * 365 });
+          repliedCount++;
+          if (repliedCount < MAX_REPLIES_PER_RUN) {
+            await new Promise((r) => setTimeout(r, DELAY_BETWEEN_SENDS_MS));
+          }
+        }
+      }
+    } while (cursor && repliedCount < MAX_REPLIES_PER_RUN);
+
+    if (repliedCount > 0) {
+      console.log(`Replied to ${repliedCount} new DM(s)`);
+    }
+  } catch (err) {
+    if (err instanceof RateLimitError) {
+      console.warn('Bluesky rate limit hit; will retry on next run');
+      return;
+    }
+    console.error('DM reply cycle error:', err);
+    await env.BOT_CONFIG.delete(SESSION_KEY);
+    throw err;
   }
 }
 
@@ -378,7 +417,7 @@ function getSetupWizardHtml(baseUrl: string): string {
   </div>
   <div class="card">
     <h2>3. Message delay</h2>
-    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Wait this many seconds before sending (0 = instant). Max 300.</p>
+    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Wait this many seconds before sending (0 = instant). 5–30 sec helps avoid spam flags. Max 300.</p>
     <label for="delay">Delay (seconds)</label>
     <input type="number" id="delay" min="0" max="300" value="0" step="1" style="width: auto;">
   </div>
@@ -531,7 +570,7 @@ function getAdminPageHtml(baseUrl: string): string {
   </div>
   <div class="card">
     <h2>Message delay</h2>
-    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Seconds to wait before sending (0 = instant). Max 300.</p>
+    <p class="sub" style="margin:0 0 0.5rem 0; font-size: 0.8rem;">Seconds to wait before sending (0 = instant). 5–30 sec helps avoid spam flags. Max 300.</p>
     <label for="delay">Delay (seconds)</label>
     <input type="number" id="delay" min="0" max="300" value="0" step="1" style="width: 6em;">
   </div>

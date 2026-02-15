@@ -31,15 +31,34 @@ export interface Convo {
   lastMessage?: ConvoLastMessage | null;
 }
 
+/** Thrown when Bluesky returns 429 Rate Limited */
+export class RateLimitError extends Error {
+  constructor() {
+    super('Bluesky rate limit exceeded');
+    this.name = 'RateLimitError';
+  }
+}
+
 export class BlueskyDmClient {
   private accessJwt: string | null = null;
   private ourDid: string | null = null;
   private handle: string;
   private serviceUrl: string;
 
-  constructor(handle: string, appPassword: string, serviceUrl: string = 'https://bsky.social') {
+  constructor(handle: string, _appPassword: string, serviceUrl: string = 'https://bsky.social') {
     this.handle = handle;
     this.serviceUrl = serviceUrl.replace(/\/$/, '');
+  }
+
+  /** Use a cached session instead of logging in (reduces API calls). */
+  setCachedSession(accessJwt: string, ourDid: string): void {
+    this.accessJwt = accessJwt;
+    this.ourDid = ourDid;
+  }
+
+  getSessionForCache(): { accessJwt: string; did: string } | null {
+    if (!this.accessJwt || !this.ourDid) return null;
+    return { accessJwt: this.accessJwt, did: this.ourDid };
   }
 
   async login(appPassword: string): Promise<void> {
@@ -51,6 +70,7 @@ export class BlueskyDmClient {
         password: appPassword,
       }),
     });
+    if (res.status === 429) throw new RateLimitError();
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Bluesky login failed: ${res.status} ${text}`);
@@ -78,6 +98,7 @@ export class BlueskyDmClient {
     if (cursor) params.append('cursor', cursor);
     const url = `${this.serviceUrl}/xrpc/chat.bsky.convo.listConvos?${params}`;
     const res = await fetch(url, { method: 'GET', headers: this.getHeaders() });
+    if (res.status === 429) throw new RateLimitError();
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`listConvos failed: ${res.status} ${text}`);
@@ -119,6 +140,7 @@ export class BlueskyDmClient {
       headers: this.getHeaders(),
       body: JSON.stringify({ convoId, message: { text: safeText } }),
     });
+    if (res.status === 429) throw new RateLimitError();
     if (!res.ok) {
       console.error('sendMessage failed:', res.status, await res.text());
       return false;
