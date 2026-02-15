@@ -181,11 +181,14 @@ async function runDmReplyCycle(env: Env): Promise<void> {
 
         const repliedKey = `${REPLIED_PREFIX}${otherDid}`;
         const alreadyReplied = await env.BOT_CONFIG.get(repliedKey);
-        if (alreadyReplied) continue;
+        if (alreadyReplied) continue; // Only ever reply once per account
 
         if (delay > 0) {
           await new Promise((r) => setTimeout(r, delay * 1000));
         }
+
+        // Re-check before send (guards against race if multiple runs overlap)
+        if (await env.BOT_CONFIG.get(repliedKey)) continue;
 
         const sent = await client.sendMessage(convo.id, welcomeMsg);
         if (sent) {

@@ -146,8 +146,8 @@ The bot runs every minute to check for new DMs. Cloudflare should add this autom
 ## How It Works
 
 1. **Every minute**, the bot checks your Bluesky DMs
-2. For each conversation where **the last message is from someone else** (not you) and **you haven't auto-replied yet**, it sends your preset message
-3. Each person gets the auto-reply **only once** — the first time they message you
+2. For each conversation where **the last message is from someone else** (not you) and **you haven't auto-replied to them yet**, it sends your preset message
+3. **Each person gets the auto-reply exactly once** — the first time they message you. After that, they can message as many times as they like and will not receive the auto-reply again
 4. The bot is designed to stay well under Bluesky's rate limits and avoid spam flags (see below)
 
 ---
@@ -156,7 +156,7 @@ The bot runs every minute to check for new DMs. Cloudflare should add this autom
 
 The bot is built to stay within Bluesky's limits and avoid triggering spam protections:
 
-- **One reply per user ever** — No repeat messages
+- **One reply per user ever** — Each account receives the auto-reply at most once, period. Stored in KV for 1 year.
 - **Max 10 replies per run** — Even with many new DMs, we cap at 10 per minute
 - **Delay between sends** — When replying to multiple people, the bot waits 3 seconds between each message
 - **429 handling** — If Bluesky returns "rate limited," the bot stops and waits for the next scheduled run
