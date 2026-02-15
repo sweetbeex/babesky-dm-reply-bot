@@ -8,6 +8,7 @@ const REPLIED_PREFIX = 'replied:';
 const DEFAULT_WELCOME = "Hi! Thanks for reaching out. How can I help you today?";
 const MAX_DELAY_SECONDS = 300;
 const MAX_REPLIES_PER_RUN = 10; // Cap to avoid spam flags
+const MAX_HISTORY_CHECKS_PER_RUN = 15; // Cap getMessages calls (checks if convo is new)
 const DELAY_BETWEEN_SENDS_MS = 3000; // 3 seconds between DMs when replying to multiple users
 
 function clampDelay(val: number): number {
@@ -167,6 +168,7 @@ async function runDmReplyCycle(env: Env): Promise<void> {
 
     let cursor: string | undefined;
     let repliedCount = 0;
+    let historyChecks = 0;
 
     do {
       const { convos, cursor: nextCursor } = await client.listConvos(50, cursor);
@@ -174,14 +176,21 @@ async function runDmReplyCycle(env: Env): Promise<void> {
 
       for (const convo of convos) {
         if (repliedCount >= MAX_REPLIES_PER_RUN) break;
+        if (historyChecks >= MAX_HISTORY_CHECKS_PER_RUN) break;
 
         const otherDid = client.getOtherParticipantDid(convo);
         if (!otherDid) continue;
+        if (!convo.id) continue;
         if (!client.isLastMessageFromOther(convo)) continue;
 
         const repliedKey = `${REPLIED_PREFIX}${otherDid}`;
         const alreadyReplied = await env.BOT_CONFIG.get(repliedKey);
         if (alreadyReplied) continue; // Only ever reply once per account
+
+        // Skip existing convos — only auto-reply when they message for the first time
+        historyChecks++;
+        const weHaveHistory = await client.hasWeEverSentInConvo(convo.id);
+        if (weHaveHistory) continue;
 
         if (delay > 0) {
           await new Promise((r) => setTimeout(r, delay * 1000));

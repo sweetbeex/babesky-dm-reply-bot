@@ -130,6 +130,36 @@ export class BlueskyDmClient {
   }
 
   /**
+   * Check if we have ever sent a message in this conversation (existing convo = skip auto-reply).
+   */
+  async hasWeEverSentInConvo(convoId: string): Promise<boolean> {
+    const ourDid = this.ourDid;
+    if (!ourDid) return false;
+    let cursor: string | undefined;
+    const maxMessagesToCheck = 200; // Cap to avoid too many API calls
+    let checked = 0;
+    do {
+      const params = new URLSearchParams();
+      params.append('convoId', convoId);
+      params.append('limit', '50');
+      if (cursor) params.append('cursor', cursor);
+      const url = `${this.serviceUrl}/xrpc/chat.bsky.convo.getMessages?${params}`;
+      const res = await fetch(url, { method: 'GET', headers: this.getHeaders() });
+      if (res.status === 429) throw new RateLimitError();
+      if (!res.ok) return true; // On error, assume we have history (skip)
+      const data = (await res.json()) as { messages?: Array<{ sender?: { did?: string } }>; cursor?: string };
+      const messages = data.messages || [];
+      for (const msg of messages) {
+        if (msg.sender && msg.sender.did === ourDid) return true;
+        checked++;
+        if (checked >= maxMessagesToCheck) return true; // Assume history when cap hit (safer)
+      }
+      cursor = data.cursor;
+    } while (cursor);
+    return false;
+  }
+
+  /**
    * Send a DM in an existing conversation.
    */
   async sendMessage(convoId: string, text: string): Promise<boolean> {
